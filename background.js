@@ -1,9 +1,11 @@
 const RESTRICTED_URL =
   /^(chrome|chrome-extension|edge|about|devtools|chrome-search|chrome-untrusted):/i;
 
-/** 同步可用的缓存：全局快捷键不能先 await 再注入，否则会丢掉用户手势 */
+/** 同步缓存：全局快捷键不能先 await 再注入，否则容易丢掉用户手势 */
 let cachedActiveTabId = null;
-/** 上次成功进入画中画的标签：关掉小窗口后再按，应优先恢复它 */
+/** 正在出声的标签（多半是正在播视频的页） */
+let lastAudibleTabId = null;
+/** 上次成功进入画中画的标签：关掉小窗口后再按应优先恢复它 */
 let lastPipTabId = null;
 
 async function flashBadge(text, color = "#1a73e8") {
@@ -23,9 +25,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 function rememberActiveTab(tabId) {
-  if (typeof tabId === "number") {
-    cachedActiveTabId = tabId;
-  }
+  if (typeof tabId === "number") cachedActiveTabId = tabId;
 }
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
@@ -34,7 +34,14 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (cachedActiveTabId === tabId) cachedActiveTabId = null;
+  if (lastAudibleTabId === tabId) lastAudibleTabId = null;
   if (lastPipTabId === tabId) lastPipTabId = null;
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.audible === true) {
+    lastAudibleTabId = tabId;
+  }
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
@@ -44,38 +51,51 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
   });
 });
 
-// 启动时预热缓存
 chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
   if (tabs[0]?.id != null) rememberActiveTab(tabs[0].id);
 });
 
+chrome.tabs.query({ audible: true }, (tabs) => {
+  if (tabs[0]?.id != null) lastAudibleTabId = tabs[0].id;
+});
+
 /**
- * 在页面里同步发起 PiP（此函数会被注入；await 之前绝不能丢掉手势）
+ * 注入到页面中执行。不要在 requestPictureInPicture 之前 await。
  * @returns {Promise<string>}
  */
 function togglePipInPage() {
-  function findLargestVideo() {
-    return Array.from(document.querySelectorAll("video"))
-      .filter((video) => video.readyState !== 0)
-      .filter((video) => video.disablePictureInPicture === false)
-      .sort((v1, v2) => {
-        const a = v1.getClientRects()[0] || { width: 0, height: 0 };
-        const b = v2.getClientRects()[0] || { width: 0, height: 0 };
-        return b.width * b.height - a.width * a.height;
-      })[0];
+  function videoScore(video) {
+    let score = 0;
+    if (!video.paused && !video.ended) score += 1e9;
+    score += (video.readyState || 0) * 1e7;
+    const rect = video.getClientRects()[0] || { width: 0, height: 0 };
+    score += rect.width * rect.height;
+    if (video.currentSrc || video.src) score += 1e5;
+    return score;
   }
 
-  // 已在画中画：再按则关闭
+  function findBestVideo() {
+    // 后台标签页里 readyState 常被刷成 0，不能只认 readyState !== 0
+    const videos = Array.from(document.querySelectorAll("video")).filter(
+      (video) =>
+        video.disablePictureInPicture === false &&
+        (video.readyState > 0 ||
+          !!video.currentSrc ||
+          !!video.src ||
+          !!video.querySelector("source"))
+    );
+    if (!videos.length) return null;
+    videos.sort((a, b) => videoScore(b) - videoScore(a));
+    return videos[0];
+  }
+
   if (document.pictureInPictureElement) {
     return document.exitPictureInPicture().then(() => "exited");
   }
 
-  const video = findLargestVideo();
-  if (!video) {
-    return Promise.resolve("no-video");
-  }
+  const video = findBestVideo();
+  if (!video) return Promise.resolve("no-video");
 
-  // 不要在 requestPictureInPicture 之前 await play()，否则用户手势会失效
   if (video.paused) {
     video.play().catch(() => {});
   }
@@ -94,9 +114,20 @@ function togglePipInPage() {
     .catch((error) => `error:${error.name}:${error.message}`);
 }
 
+function probeHasVideo() {
+  return Array.from(document.querySelectorAll("video")).some(
+    (video) =>
+      video.disablePictureInPicture === false &&
+      (video.readyState > 0 ||
+        !!video.currentSrc ||
+        !!video.src ||
+        !!video.querySelector("source"))
+  );
+}
+
 function pickResult(results) {
   if (!results?.length) return "no-video";
-  const statuses = results.map((r) => r?.result).filter(Boolean);
+  const statuses = results.map((r) => r?.result).filter((v) => v != null);
   if (statuses.includes("entered")) return "entered";
   if (statuses.includes("exited")) return "exited";
   const err = statuses.find((s) => String(s).startsWith("error:"));
@@ -104,122 +135,255 @@ function pickResult(results) {
   return "no-video";
 }
 
-function handleInjectResults(tabId, results) {
+function runInject(tabId) {
+  return chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: togglePipInPage,
+  });
+}
+
+async function wakeTab(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (tab.windowId != null) {
+    await chrome.windows.update(tab.windowId, { focused: true });
+  }
+  await chrome.tabs.update(tabId, { active: true });
+  if (tab.discarded) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 1500);
+      const onUpdated = (id, info) => {
+        if (id === tabId && info.status === "complete") {
+          clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(onUpdated);
+    });
+  } else {
+    await new Promise((r) => setTimeout(r, 120));
+  }
+}
+
+function uniqueTabIds(ids) {
+  const seen = new Set();
+  const out = [];
+  for (const id of ids) {
+    if (typeof id !== "number" || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * 全局快捷键优先恢复「上次 PiP / 正在出声」的标签，
+ * 不要优先用事件里的当前活动标签（常常是无视频的页面 → 显示 NO）。
+ */
+function candidateTabIdsSync(tabFromEvent, fromCommand) {
+  if (fromCommand) {
+    return uniqueTabIds([
+      lastPipTabId,
+      lastAudibleTabId,
+      cachedActiveTabId,
+      tabFromEvent?.id,
+    ]);
+  }
+  return uniqueTabIds([tabFromEvent?.id, lastPipTabId, lastAudibleTabId, cachedActiveTabId]);
+}
+
+async function collectFallbackTabIds(excludeIds) {
+  const excluded = new Set(excludeIds);
+  const ids = [];
+
+  const push = (id) => {
+    if (typeof id === "number" && !excluded.has(id) && !ids.includes(id)) {
+      ids.push(id);
+    }
+  };
+
+  push(lastPipTabId);
+  push(lastAudibleTabId);
+
+  const audible = await chrome.tabs.query({ audible: true });
+  for (const tab of audible) push(tab.id);
+
+  const httpTabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  // 最近访问的靠前一点
+  httpTabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  for (const tab of httpTabs.slice(0, 12)) push(tab.id);
+
+  return ids;
+}
+
+async function tabLooksPromising(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.id || (tab.url && RESTRICTED_URL.test(tab.url))) return false;
+    if (tab.discarded) {
+      await wakeTab(tabId);
+    }
+    const probe = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: probeHasVideo,
+    });
+    return (probe || []).some((r) => r?.result === true);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function fallbackToggle(triedIds) {
+  const candidates = await collectFallbackTabIds(triedIds);
+  for (const tabId of candidates) {
+    const ok = await tabLooksPromising(tabId);
+    if (!ok) continue;
+    try {
+      // 后台页视频可能还没就绪：先唤醒再切换
+      await wakeTab(tabId);
+      const results = await runInject(tabId);
+      const status = pickResult(results);
+      if (status === "no-video") continue;
+      handleInjectResults(tabId, results);
+      return;
+    } catch (error) {
+      console.warn("fallback inject failed:", tabId, error);
+    }
+  }
+  flashBadge("NO", "#f9ab00");
+}
+
+function handleInjectResults(tabId, results, options = {}) {
   const status = pickResult(results);
+  const nextCandidates = options.nextCandidates || [];
+  const triedIds = options.triedIds || [tabId];
+
   if (status === "entered") {
     lastPipTabId = tabId;
+    lastAudibleTabId = tabId;
     flashBadge("OK", "#0d904f");
     return;
   }
   if (status === "exited") {
+    // 保留 lastPipTabId，方便关掉小窗口后再次恢复
     flashBadge("OFF", "#5f6368");
     return;
   }
   if (status === "no-video") {
+    if (nextCandidates.length) {
+      injectToggle(nextCandidates[0], nextCandidates.slice(1), triedIds);
+      return;
+    }
+    if (options.allowFallback !== false) {
+      fallbackToggle(triedIds);
+      return;
+    }
     flashBadge("NO", "#f9ab00");
     return;
   }
   console.warn("PiP failed:", status);
+  // NotAllowedError 等：先唤醒同一标签再试一次；仍失败则换其它候选标签
+  if (options.allowWakeRetry !== false) {
+    (async () => {
+      try {
+        await wakeTab(tabId);
+        const results2 = await runInject(tabId);
+        const status2 = pickResult(results2);
+        if (status2 === "entered" || status2 === "exited") {
+          handleInjectResults(tabId, results2, {
+            allowFallback: false,
+            allowWakeRetry: false,
+          });
+          return;
+        }
+        if (nextCandidates.length) {
+          injectToggle(nextCandidates[0], nextCandidates.slice(1), triedIds);
+          return;
+        }
+        await fallbackToggle(triedIds);
+      } catch (error) {
+        console.warn("wake retry failed:", error);
+        if (nextCandidates.length) {
+          injectToggle(nextCandidates[0], nextCandidates.slice(1), triedIds);
+          return;
+        }
+        await fallbackToggle(triedIds);
+      }
+    })();
+    return;
+  }
   flashBadge("X", "#d93025");
 }
 
 /**
- * 关键：listener 里先 await 再 executeScript，全局快捷键下 PiP 会因丢失手势而失败。
+ * 同步立刻注入（保留手势）。若该标签没有视频，继续试下一个候选，再全局扫描。
  */
-function injectToggle(tabId) {
-  const pending = chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
-    func: togglePipInPage,
-  });
-
+function injectToggle(tabId, nextCandidates = [], previouslyTried = []) {
+  const triedIds = uniqueTabIds([...previouslyTried, tabId]);
+  const pending = runInject(tabId);
   pending
-    .then((results) => handleInjectResults(tabId, results))
+    .then((results) =>
+      handleInjectResults(tabId, results, {
+        allowFallback: true,
+        allowWakeRetry: true,
+        triedIds,
+        nextCandidates,
+      })
+    )
     .catch(async (error) => {
-      console.warn("inject failed, retry after focus:", error);
+      console.warn("inject failed, wake and retry:", error);
       try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId != null) {
-          await chrome.windows.update(tab.windowId, { focused: true });
-        }
-        await chrome.tabs.update(tabId, { active: true });
-        const results = await chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          func: togglePipInPage,
+        await wakeTab(tabId);
+        const results = await runInject(tabId);
+        handleInjectResults(tabId, results, {
+          allowFallback: true,
+          allowWakeRetry: false,
+          triedIds,
+          nextCandidates,
         });
-        handleInjectResults(tabId, results);
       } catch (retryError) {
         console.warn("PiP retry failed:", retryError);
-        flashBadge("X", "#d93025");
+        if (nextCandidates.length) {
+          injectToggle(nextCandidates[0], nextCandidates.slice(1), triedIds);
+          return;
+        }
+        fallbackToggle(triedIds);
       }
     });
 }
 
-function resolveTabIdSync(tabFromEvent) {
-  // 1) 事件自带 tab（「在 Chrome 中」时常见）
-  // 2) 上次成功 PiP 的标签（关掉小窗口后按快捷键应恢复）
-  // 3) 缓存的当前活动标签
-  return tabFromEvent?.id ?? lastPipTabId ?? cachedActiveTabId;
-}
-
-async function resolveTabIdAsync() {
-  if (lastPipTabId) {
-    try {
-      const tab = await chrome.tabs.get(lastPipTabId);
-      if (tab?.id && (!tab.url || !RESTRICTED_URL.test(tab.url))) {
-        return tab.id;
-      }
-    } catch (_) {
-      lastPipTabId = null;
-    }
-  }
-
-  const lastFocused = await chrome.tabs.query({
-    active: true,
-    lastFocusedWindow: true,
-  });
-  for (const tab of lastFocused) {
-    if (tab?.id && tab.url && !RESTRICTED_URL.test(tab.url)) {
-      return tab.id;
-    }
-  }
-
-  const windows = await chrome.windows.getAll({ populate: true });
-  for (const win of windows) {
-    if (win.type && win.type !== "normal") continue;
-    const active = (win.tabs || []).find((t) => t.active);
-    if (active?.id && active.url && !RESTRICTED_URL.test(active.url)) {
-      return active.id;
-    }
-  }
-  return null;
-}
-
-function togglePictureInPicture(tabFromEvent) {
-  const syncId = resolveTabIdSync(tabFromEvent);
-  if (syncId) {
-    // 同步路径：立刻注入，保留全局快捷键用户手势
-    injectToggle(syncId);
+function togglePictureInPicture(tabFromEvent, fromCommand) {
+  const candidates = candidateTabIdsSync(tabFromEvent, fromCommand);
+  if (candidates.length) {
+    injectToggle(candidates[0], candidates.slice(1));
     return;
   }
 
-  // 仅在没有缓存时才异步查找（可能仍会因手势丢失而失败，失败后会聚焦重试）
-  resolveTabIdAsync().then((tabId) => {
-    if (!tabId) {
-      flashBadge("?", "#d93025");
+  (async () => {
+    const audible = await chrome.tabs.query({ audible: true });
+    if (audible[0]?.id) {
+      injectToggle(audible[0].id);
       return;
     }
-    rememberActiveTab(tabId);
-    injectToggle(tabId);
-  });
+    const lastFocused = await chrome.tabs.query({
+      active: true,
+      lastFocusedWindow: true,
+    });
+    if (lastFocused[0]?.id) {
+      injectToggle(lastFocused[0].id);
+      return;
+    }
+    flashBadge("?", "#d93025");
+  })();
 }
 
 chrome.action.onClicked.addListener((tab) => {
   if (tab?.id) rememberActiveTab(tab.id);
-  togglePictureInPicture(tab);
+  togglePictureInPicture(tab, false);
 });
 
 chrome.commands.onCommand.addListener((command, tab) => {
   if (command !== "toggle-pip") return;
-  // 这里不能做任何 await，必须同步进入 injectToggle
-  togglePictureInPicture(tab);
+  // 不能在此 await；必须同步进入首次 inject
+  togglePictureInPicture(tab, true);
 });

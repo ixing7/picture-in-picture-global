@@ -41,5 +41,5 @@
   "offline_enabled": true,
   "host_permissions": ["http://*/*", "https://*/*"],
   "permissions": ["activeTab", "alarms", "scripting", "tabs"],
-  "version": "3.0.3"
+  "version": "3.0.4"
 }
