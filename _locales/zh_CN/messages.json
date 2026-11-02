@@ -1,0 +1,11 @@
+{
+   "application_description": {
+      "message": "一键将网页视频放入画中画小窗口，支持全局快捷键（即使在其他软件里也能切换）。"
+   },
+   "application_title": {
+      "message": "画中画视频（全局快捷键）"
+   },
+   "command_toggle_pip": {
+      "message": "切换当前视频的画中画"
+   }
+}

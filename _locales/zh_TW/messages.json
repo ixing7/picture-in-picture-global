@@ -1,0 +1,11 @@
+{
+   "application_description": {
+      "message": "一鍵將網頁影片放入子母畫面小視窗，支援全域快捷鍵（即使在其他軟體裡也能切換）。"
+   },
+   "application_title": {
+      "message": "子母畫面影片（全域快捷鍵）"
+   },
+   "command_toggle_pip": {
+      "message": "切換目前影片的子母畫面"
+   }
+}

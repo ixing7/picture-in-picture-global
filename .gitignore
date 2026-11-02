@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.crx
+*.pem
+*.zip
+.idea/
+.vscode/
+*.log
+_metadata/

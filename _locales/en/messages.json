@@ -1,0 +1,11 @@
+{
+   "application_description": {
+      "message": "Put webpage videos into a Picture-in-Picture window. Supports a global hotkey even outside Chrome."
+   },
+   "application_title": {
+      "message": "Picture in Picture (Global Hotkey)"
+   },
+   "command_toggle_pip": {
+      "message": "Toggle picture-in-picture for the current video"
+   }
+}
