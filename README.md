@@ -25,7 +25,7 @@
 ### 方式二：使用 Git 克隆
 
 ```bash
-git clone https://github.com/<你的用户名>/<仓库名>.git
+git clone https://github.com/ixing7/picture-in-picture-global.git
 ```
 
 然后用克隆出来的文件夹加载扩展。
